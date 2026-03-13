@@ -530,6 +530,59 @@ async function saveSvcIdx(svcs) {
   }
 }
 
+// ══════════ FIREBASE CONTENT ══════════
+async function saveContentToFirebase(id, html) {
+  if (!fbDb) return;
+  try {
+    if (html.length < 900000) {
+      await fbDb.collection('hub_content').doc(id).set({ html, ts: Date.now() });
+    } else {
+      const chunkSize = 800000;
+      const chunks = [];
+      for (let i = 0; i < html.length; i += chunkSize) { chunks.push(html.slice(i, i + chunkSize)); }
+      const batch = fbDb.batch();
+      chunks.forEach((chunk, idx) => { batch.set(fbDb.collection('hub_content').doc(id + '_chunk_' + idx), { chunk, idx, total: chunks.length, parentId: id }); });
+      batch.set(fbDb.collection('hub_content').doc(id), { chunked: true, total: chunks.length, ts: Date.now() });
+      await batch.commit();
+    }
+  } catch(e) { console.warn('Firebase content save failed:', e.message); }
+}
+
+async function loadContentFromFirebase(id) {
+  if (!fbDb) return null;
+  try {
+    const snap = await fbDb.collection('hub_content').doc(id).get();
+    if (!snap.exists) return null;
+    const data = snap.data();
+    if (data.html) return data.html;
+    if (data.chunked) {
+      const chunks = [];
+      for (let i = 0; i < data.total; i++) {
+        const cSnap = await fbDb.collection('hub_content').doc(id + '_chunk_' + i).get();
+        if (cSnap.exists) chunks.push(cSnap.data().chunk);
+      }
+      return chunks.join('');
+    }
+    return null;
+  } catch(e) { console.warn('Firebase content load failed:', e.message); return null; }
+}
+
+async function deleteContentFromFirebase(id) {
+  if (!fbDb) return;
+  try {
+    const snap = await fbDb.collection('hub_content').doc(id).get();
+    if (snap.exists) {
+      const data = snap.data();
+      if (data.chunked) {
+        const batch = fbDb.batch();
+        for (let i = 0; i < data.total; i++) { batch.delete(fbDb.collection('hub_content').doc(id + '_chunk_' + i)); }
+        batch.delete(fbDb.collection('hub_content').doc(id));
+        await batch.commit();
+      } else { await fbDb.collection('hub_content').doc(id).delete(); }
+    }
+  } catch(e) { console.warn('Firebase content delete failed:', e); }
+}
+
 async function loadServices() {
   showSkel();
   if (!fbDb) initFirebase();
@@ -679,10 +732,22 @@ async function launch(id) {
       frame.onload = () => { loader.style.display = 'none'; frame.style.display = 'block'; };
       return;
     }
-    // Load from IDB
+    // Pehle local IndexedDB check karo
+    let htmlContent = null;
     const rec = await IDB.get(id);
-    if (!rec || !rec.html) throw new Error('Service file not found in storage');
-    const injected = injectKeys(rec.html);
+    if (rec && rec.html) { htmlContent = rec.html; }
+
+    // Local mein nahi mila toh Firebase se load karo
+    if (!htmlContent) {
+      loader.innerHTML = '<div class="spin"></div><div style="font-size:12px;color:var(--muted)">Loading from cloud…</div>';
+      htmlContent = await loadContentFromFirebase(id);
+      if (htmlContent) {
+        await IDB.set(id, htmlContent);
+        toast('Service loaded from cloud ✅', 'ok');
+      }
+    }
+    if (!htmlContent) throw new Error('Service file not found in storage');
+    const injected = injectKeys(htmlContent);
     const blob = new Blob([injected], { type: 'text/html' });
     const url = URL.createObjectURL(blob);
     BCACHE.set(id, url);
@@ -980,6 +1045,8 @@ async function doUpload() {
         setP(true, 15 + Math.floor((i / files.length) * 70), `Saving "${files[i].name}"…`);
         const id = 'svc_' + Date.now() + '_' + i;
         await IDB.set(id, files[i].content);
+        // Firebase mein bhi save karo — sabhi devices pe dikhega
+        await saveContentToFirebase(id, files[i].content);
         // Pre-warm blob cache with keys injected
         const injected = injectKeys(files[i].content);
         const blob = new Blob([injected], { type: 'text/html' });
@@ -1010,6 +1077,7 @@ async function delSvc(id) {
   if (!confirm('Delete this service?')) return;
   SVCS = SVCS.filter(s => s.id !== id);
   await IDB.del(id);
+  await deleteContentFromFirebase(id);
   if (BCACHE.has(id)) { URL.revokeObjectURL(BCACHE.get(id)); BCACHE.delete(id); }
   await saveSvcIdx(SVCS);
   renderGrid(); renderTabs(); renderATab();
